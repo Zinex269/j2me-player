@@ -1,0 +1,225 @@
+name: Build J2ME Player + Runtime APKs
+
+# Put this file at .github/workflows/build.yml and the HTML file at the repo root as index.html.
+# Two APKs come out: the player (your HTML) and the runtime (J2ME-Loader, Apache-2.0). Install both.
+env:
+  APP_NAME: "J2ME Player"
+  ICON_SCALE: "1.0"
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  player:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Create the Capacitor project
+        run: |
+          mkdir -p www assets
+          cp index.html www/index.html
+          npm init -y
+          npm install @capacitor/core @capacitor/android
+          npm install -D @capacitor/cli @capacitor/assets
+          cat > capacitor.config.json <<EOF
+          {
+            "appId": "com.example.j2meplayer",
+            "appName": "$APP_NAME",
+            "webDir": "www",
+            "android": { "adjustMarginsForEdgeToEdge": "auto" }
+          }
+          EOF
+
+      - name: Make the app icon
+        run: |
+          pip install pillow
+          python3 - <<'PY'
+          import os
+          from PIL import Image, ImageDraw, ImageFilter
+          N = 1024
+          if os.path.exists('icon.png'):
+              im = Image.open('icon.png').convert('RGBA')
+              w, h = im.size; m = min(w, h)
+              im = im.crop(((w - m) // 2, (h - m) // 2, (w - m) // 2 + m, (h - m) // 2 + m)).resize((N, N), Image.LANCZOS)
+              im.save('assets/icon-only.png')
+              flat = Image.alpha_composite(Image.new('RGBA', (N, N), (255, 255, 255, 255)), im)
+              zoom = flat.crop((N // 5, N // 5, N - N // 5, N - N // 5)).resize((N, N), Image.LANCZOS)
+              zoom.filter(ImageFilter.GaussianBlur(30)).save('assets/icon-background.png')
+              scale = max(0.3, min(1.0, float(os.environ.get('ICON_SCALE', '1.0'))))
+              s = int(N * scale)
+              fg = Image.new('RGBA', (N, N), (0, 0, 0, 0))
+              fg.paste(im.resize((s, s), Image.LANCZOS), ((N - s) // 2, (N - s) // 2))
+              fg.save('assets/icon-foreground.png')
+          else:
+              def phone(frac):
+                  s = int(N * frac); o = (N - s) // 2
+                  im = Image.new('RGBA', (N, N), (0, 0, 0, 0)); d = ImageDraw.Draw(im)
+                  d.rounded_rectangle([o + s * .2, o, o + s * .8, o + s], radius=int(s * .14), fill=(34, 42, 70, 255), outline=(109, 134, 255, 255), width=int(s * .03))
+                  d.rounded_rectangle([o + s * .28, o + s * .1, o + s * .72, o + s * .46], radius=int(s * .04), fill=(13, 19, 32, 255))
+                  cx, cy, r = o + s * .5, o + s * .66, s * .1
+                  d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(109, 134, 255, 255))
+                  for dx in (-.2, .2):
+                      kx, ky, kr = o + s * (.5 + dx), o + s * .87, s * .04
+                      d.ellipse([kx - kr, ky - kr, kx + kr, ky + kr], fill=(139, 148, 173, 255))
+                  return im
+              bg = Image.new('RGBA', (N, N), (23, 29, 50, 255))
+              bg.save('assets/icon-background.png')
+              phone(.6).save('assets/icon-foreground.png')
+              Image.alpha_composite(bg, phone(.7)).save('assets/icon-only.png')
+          Image.new('RGB', (2732, 2732), (236, 239, 246)).save('assets/splash.png')
+          Image.new('RGB', (2732, 2732), (15, 19, 32)).save('assets/splash-dark.png')
+          PY
+
+      - name: Add the Android platform
+        run: npx cap add android
+
+      - name: Add the native J2ME bridge
+        run: |
+          D=android/app/src/main/java/com/example/j2meplayer
+          M=android/app/src/main/AndroidManifest.xml
+          mkdir -p "$D" android/app/src/main/res/xml
+
+          cat > "$D/MainActivity.java" <<'JAVA'
+          package com.example.j2meplayer;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              registerPlugin(J2MELauncherPlugin.class);
+              super.onCreate(savedInstanceState);
+            }
+          }
+          JAVA
+
+          cat > "$D/J2MELauncherPlugin.java" <<'JAVA'
+          package com.example.j2meplayer;
+
+          import android.content.ActivityNotFoundException;
+          import android.content.ComponentName;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.util.Base64;
+          import androidx.core.content.FileProvider;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.File;
+          import java.io.FileOutputStream;
+
+          @CapacitorPlugin(name = "J2MELauncher")
+          public class J2MELauncherPlugin extends Plugin {
+            private static final String RT = "ru.playsoftware.j2meloader";
+
+            @PluginMethod
+            public void isRuntimeInstalled(PluginCall call) {
+              JSObject r = new JSObject();
+              try {
+                getContext().getPackageManager().getPackageInfo(RT, 0);
+                r.put("installed", true);
+              } catch (Exception e) {
+                r.put("installed", false);
+              }
+              call.resolve(r);
+            }
+
+            @PluginMethod
+            public void launch(PluginCall call) {
+              String b64 = call.getString("data");
+              String name = call.getString("name", "game");
+              if (b64 == null || b64.isEmpty()) { call.reject("No game data"); return; }
+              try {
+                File dir = new File(getContext().getCacheDir(), "jars");
+                dir.mkdirs();
+                String safe = name.replaceAll("[^A-Za-z0-9._-]", "_");
+                if (!safe.toLowerCase().endsWith(".jar")) safe += ".jar";
+                File f = new File(dir, safe);
+                try (FileOutputStream o = new FileOutputStream(f)) {
+                  o.write(Base64.decode(b64, Base64.DEFAULT));
+                }
+                Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", f);
+                Intent i = new Intent(Intent.ACTION_VIEW);
+                i.setDataAndType(uri, "application/java-archive");
+                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                i.setComponent(new ComponentName(RT, RT + ".MainActivity"));
+                try {
+                  getActivity().startActivity(i);
+                } catch (ActivityNotFoundException | SecurityException e) {
+                  i.setComponent(null);
+                  i.setPackage(RT);
+                  getActivity().startActivity(i);
+                }
+                call.resolve();
+              } catch (ActivityNotFoundException e) {
+                call.reject("J2ME-Loader could not open this game. Open it from the J2ME-Loader app instead.", e);
+              } catch (Exception e) {
+                call.reject("Launch failed: " + e.getMessage(), e);
+              }
+            }
+          }
+          JAVA
+
+          cat > android/app/src/main/res/xml/file_paths.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths xmlns:android="http://schemas.android.com/apk/res/android">
+            <cache-path name="cache" path="." />
+            <files-path name="files" path="." />
+            <external-path name="ext" path="." />
+          </paths>
+          XML
+
+          grep -q 'fileprovider' "$M" || sed -i 's#</application>#<provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.fileprovider" android:exported="false" android:grantUriPermissions="true"><meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths"/></provider></application>#' "$M"
+          sed -i 's#<application#<queries><package android:name="ru.playsoftware.j2meloader"/></queries><application#' "$M"
+
+      - name: Build the APK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          npx capacitor-assets generate --android || echo "Icon step skipped"
+          npx cap sync android
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: j2me-player-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+  runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Get J2ME-Loader source (Apache-2.0)
+        run: git clone --depth 1 https://github.com/nikita36078/J2ME-Loader.git runtime
+
+      - name: Build the runtime APK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          cd runtime
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: j2me-runtime-apk
+          path: runtime/app/build/outputs/apk/**/*.apk
